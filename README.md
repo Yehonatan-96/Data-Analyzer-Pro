@@ -66,12 +66,11 @@ Clean your signal and analyze frequency components with professional-grade tools
 * Recommended: A virtual environment.
 
 ### Steps
-1.  **Clone the repository:**
-    ```bash
-    git clone [https://github.com/YOUR_USERNAME/Data-Analyzer-Pro.git](https://github.com/YOUR_USERNAME/Data-Analyzer-Pro.git)
-    cd Data-Analyzer-Pro
-    ```
-
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/Yehonatan-96/Data-Analyzer-Pro.git
+   cd Data-Analyzer-Pro
+   ```
 2.  **Install dependencies:**
     ```bash
     pip install -r requirements.txt
