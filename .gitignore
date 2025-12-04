@@ -1,0 +1,22 @@
+# Python cache & Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.spec
+dist/
+build/
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE Settings (JetBrains / VS Code)
+.idea/
+.vscode/
+*.swp
+
+# Excel temp files
+~$*.xlsx
