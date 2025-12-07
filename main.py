@@ -113,8 +113,7 @@ class DataAnalyzerApp:
 
         # -------- Dynamic Icon Loading  --------
         # This creates a path relative to the script location
-        script_dir = Path(__file__).parent.absolute()
-        icon_path = script_dir / "icon.ico"
+        icon_path = resource_path("icon.ico")
 
         try:
             if icon_path.exists():
@@ -132,9 +131,17 @@ class DataAnalyzerApp:
         self.canvas_widget = None
         self.filter_frame_vars = None
         self.channel_conditioning = {}
+        self.current_file_path = None
+        self.undo_stack = []
+        self.redo_stack = []
+        self.show_sidebar_var = tk.BooleanVar(value=True)
+        self.show_status_var = tk.BooleanVar(value=True)
+        self.navigation_toolbar = None
 
         # build GUI
+        self.create_menu_bar()
         self.create_layout()
+        self.create_status_bar()  # Must be after create_layout to use grid
         self.window.mainloop()
 
     # ---- Fitting helpers ----
@@ -315,12 +322,580 @@ class DataAnalyzerApp:
         params_text = ", ".join(f"p{i}={v:.3g}" for i, v in enumerate(popt))
         self.fit_result_label.configure(text=f"R^2: {r2:.4f}   ({name})  [{params_text}]")
 
+    def create_menu_bar(self):
+        """Create main menu bar with File, Edit, View, Help menus"""
+        # Note: CustomTkinter doesn't have native menu support, so we use tkinter Menu
+        menubar = tk.Menu(self.window)
+        self.window.config(menu=menubar)
+        
+        # File Menu
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Open File...", command=self.load_file, accelerator="Ctrl+O")
+        file_menu.add_separator()
+        
+        # Recent Files submenu
+        self.recent_files_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="Recent Files", menu=self.recent_files_menu)
+        self.update_recent_files()
+        
+        file_menu.add_separator()
+        file_menu.add_command(label="Save Project...", command=self.save_project, accelerator="Ctrl+S")
+        file_menu.add_command(label="Load Project...", command=self.load_project, accelerator="Ctrl+Shift+O")
+        file_menu.add_separator()
+        
+        # Export submenu
+        export_menu = tk.Menu(file_menu, tearoff=0)
+        file_menu.add_cascade(label="Export", menu=export_menu)
+        export_menu.add_command(label="Export Plot...", command=self.export_plot_dialog)
+        export_menu.add_command(label="Export Data...", command=self.save_results)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.window.quit, accelerator="Alt+F4")
+        
+        # Edit Menu
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+        self.undo_menu_item = edit_menu.add_command(label="Undo", command=self.undo_action, accelerator="Ctrl+Z", state="disabled")
+        self.redo_menu_item = edit_menu.add_command(label="Redo", command=self.redo_action, accelerator="Ctrl+Y", state="disabled")
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Preferences...", command=self.open_preferences)
+        
+        # View Menu
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="View", menu=view_menu)
+        view_menu.add_checkbutton(label="Show Sidebar", variable=self.show_sidebar_var, command=self.toggle_sidebar)
+        view_menu.add_checkbutton(label="Show Status Bar", variable=self.show_status_var, command=self.toggle_status_bar)
+        view_menu.add_separator()
+        view_menu.add_command(label="Zoom In", command=self.zoom_in, accelerator="Ctrl++")
+        view_menu.add_command(label="Zoom Out", command=self.zoom_out, accelerator="Ctrl+-")
+        view_menu.add_command(label="Reset View", command=self.reset_plot_view, accelerator="Ctrl+0")
+        view_menu.add_separator()
+        view_menu.add_command(label="Data Browser", command=self.open_data_browser, accelerator="Ctrl+B")
+        
+        # Help Menu
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="Keyboard Shortcuts", command=self.show_shortcuts)
+        help_menu.add_separator()
+        help_menu.add_command(label="About", command=self.show_about)
+        
+        # Bind keyboard shortcuts
+        self.window.bind("<Control-o>", lambda e: self.load_file())
+        self.window.bind("<Control-O>", lambda e: self.load_file())
+        self.window.bind("<Control-s>", lambda e: self.save_project())
+        self.window.bind("<Control-S>", lambda e: self.save_project())
+        self.window.bind("<Control-z>", lambda e: self.undo_action())
+        self.window.bind("<Control-Z>", lambda e: self.undo_action())
+        self.window.bind("<Control-y>", lambda e: self.redo_action())
+        self.window.bind("<Control-Y>", lambda e: self.redo_action())
+        self.window.bind("<Control-plus>", lambda e: self.zoom_in())
+        self.window.bind("<Control-equal>", lambda e: self.zoom_in())
+        self.window.bind("<Control-minus>", lambda e: self.zoom_out())
+        self.window.bind("<Control-0>", lambda e: self.reset_plot_view())
+        self.window.bind("<Control-b>", lambda e: self.open_data_browser())
+        self.window.bind("<Control-B>", lambda e: self.open_data_browser())
+
+    def create_status_bar(self):
+        """Create status bar at the bottom of the window"""
+        self.status_frame = ctk.CTkFrame(self.window, height=25, corner_radius=0)
+        # Use grid instead of pack to be compatible with main window grid layout
+        self.status_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+        self.status_frame.grid_propagate(False)
+        
+        # Configure grid columns for status bar
+        self.status_frame.grid_columnconfigure(1, weight=1)  # Middle column expands
+        
+        # Left side - Main status
+        self.status_label = ctk.CTkLabel(
+            self.status_frame,
+            text="Ready",
+            anchor="w",
+            font=ctk.CTkFont(size=11)
+        )
+        self.status_label.grid(row=0, column=0, padx=10, pady=2, sticky="w")
+        
+        # Middle - Data info
+        self.data_info_label = ctk.CTkLabel(
+            self.status_frame,
+            text="No data loaded",
+            anchor="w",
+            font=ctk.CTkFont(size=10),
+            text_color=("gray50", "gray70")
+        )
+        self.data_info_label.grid(row=0, column=1, padx=10, pady=2, sticky="ew")
+        
+        # Right side - Memory/Progress
+        self.memory_label = ctk.CTkLabel(
+            self.status_frame,
+            text="",
+            anchor="e",
+            font=ctk.CTkFont(size=10),
+            text_color=("gray50", "gray70")
+        )
+        self.memory_label.grid(row=0, column=2, padx=10, pady=2, sticky="e")
+        
+        # Progress bar (hidden by default)
+        self.progress_bar = ctk.CTkProgressBar(self.status_frame, width=200)
+        self.progress_bar.grid(row=0, column=3, padx=10, pady=2, sticky="e")
+        self.progress_bar.grid_remove()
+        
+        # Start memory monitoring
+        self.update_memory_usage()
+
+    # ========== Menu and Status Bar Helper Functions ==========
+    
+    def update_status(self, message, data_info=None):
+        """Update status bar message"""
+        self.status_label.configure(text=message)
+        if data_info:
+            self.data_info_label.configure(text=data_info)
+    
+    def update_memory_usage(self):
+        """Update memory usage display"""
+        try:
+            import psutil
+            import os
+            process = psutil.Process(os.getpid())
+            memory_mb = process.memory_info().rss / 1024 / 1024
+            self.memory_label.configure(text=f"Memory: {memory_mb:.1f} MB")
+        except ImportError:
+            self.memory_label.configure(text="")
+        except Exception:
+            pass
+        # Update every 5 seconds
+        self.window.after(5000, self.update_memory_usage)
+    
+    def show_progress(self, value):
+        """Show progress bar"""
+        self.progress_bar.grid(row=0, column=3, padx=10, pady=2, sticky="e")
+        self.progress_bar.set(value)
+        self.window.update_idletasks()
+    
+    def hide_progress(self):
+        """Hide progress bar"""
+        self.progress_bar.grid_remove()
+    
+    def toggle_sidebar(self):
+        """Toggle sidebar visibility"""
+        if self.show_sidebar_var.get():
+            self.sidebar_frame.grid()
+        else:
+            self.sidebar_frame.grid_remove()
+    
+    def toggle_status_bar(self):
+        """Toggle status bar visibility"""
+        if self.show_status_var.get():
+            self.status_frame.grid(row=1, column=0, columnspan=3, sticky="ew")
+        else:
+            self.status_frame.grid_remove()
+    
+    def zoom_in(self):
+        """Zoom in on plot"""
+        if self.fig and hasattr(self, 'navigation_toolbar') and self.navigation_toolbar:
+            # Navigation toolbar handles this
+            pass
+    
+    def zoom_out(self):
+        """Zoom out on plot"""
+        if self.fig and hasattr(self, 'navigation_toolbar') and self.navigation_toolbar:
+            # Navigation toolbar handles this
+            pass
+    
+    def reset_plot_view(self):
+        """Reset plot view to default"""
+        if self.fig:
+            for ax in self.fig.get_axes():
+                ax.relim()
+                ax.autoscale()
+            if hasattr(self, 'canvas_widget') and self.canvas_widget:
+                self.canvas_widget.draw()
+    
+    def undo_action(self):
+        """Undo last action"""
+        if self.undo_stack:
+            action = self.undo_stack.pop()
+            self.redo_stack.append(action)
+            if self.undo_stack:
+                self.undo_menu_item.config(state="normal")
+            else:
+                self.undo_menu_item.config(state="disabled")
+            if self.redo_stack:
+                self.redo_menu_item.config(state="normal")
+    
+    def redo_action(self):
+        """Redo last undone action"""
+        if self.redo_stack:
+            action = self.redo_stack.pop()
+            self.undo_stack.append(action)
+            if self.undo_stack:
+                self.undo_menu_item.config(state="normal")
+            if self.redo_stack:
+                self.redo_menu_item.config(state="normal")
+            else:
+                self.redo_menu_item.config(state="disabled")
+    
+    def open_preferences(self):
+        """Open preferences dialog"""
+        messagebox.showinfo("Preferences", "Preferences dialog coming soon!")
+    
+    def show_shortcuts(self):
+        """Show keyboard shortcuts dialog"""
+        shortcuts_text = """Keyboard Shortcuts:
+
+File Operations:
+  Ctrl+O          Open File
+  Ctrl+S          Save Project
+  Ctrl+Shift+O    Load Project
+  Alt+F4          Exit
+
+Edit Operations:
+  Ctrl+Z          Undo
+  Ctrl+Y          Redo
+
+View Operations:
+  Ctrl++          Zoom In
+  Ctrl+-          Zoom Out
+  Ctrl+0          Reset View
+  Ctrl+B          Data Browser"""
+        
+        dialog = ctk.CTkToplevel(self.window)
+        dialog.title("Keyboard Shortcuts")
+        dialog.geometry("400x300")
+        dialog.transient(self.window)
+        
+        text_widget = tk.Text(dialog, wrap="word", font=("Courier", 10), padx=10, pady=10)
+        text_widget.pack(fill="both", expand=True, padx=10, pady=10)
+        text_widget.insert("1.0", shortcuts_text)
+        text_widget.config(state="disabled")
+        
+        close_btn = ctk.CTkButton(dialog, text="Close", command=dialog.destroy)
+        close_btn.pack(pady=10)
+    
+    def show_about(self):
+        """Show about dialog"""
+        about_text = """Data Analyzer Pro v1.0.0
+
+A comprehensive GUI tool for analyzing experimental data.
+Developed as part of M.Sc. research in Applied Physics at Bar-Ilan University.
+
+Features:
+• Automated signal processing
+• FFT analysis
+• Curve fitting
+• Advanced calculations
+
+Copyright (c) 2025 Yehonatan Smaja
+License: GNU GPL v3"""
+        
+        messagebox.showinfo("About Data Analyzer Pro", about_text)
+    
+    # ========== Recent Files Functions ==========
+    
+    def get_recent_files_path(self):
+        """Get path to recent files storage"""
+        recent_dir = Path.home() / ".data_analyzer_pro"
+        recent_dir.mkdir(parents=True, exist_ok=True)
+        return recent_dir / "recent_files.json"
+    
+    def load_recent_files(self):
+        """Load list of recent files"""
+        recent_path = self.get_recent_files_path()
+        if recent_path.exists():
+            try:
+                import json
+                with open(recent_path, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
+    
+    def save_recent_files(self, files_list):
+        """Save list of recent files"""
+        import json
+        recent_path = self.get_recent_files_path()
+        with open(recent_path, 'w') as f:
+            json.dump(files_list[:10], f)  # Keep only 10 most recent
+    
+    def add_to_recent_files(self, file_path):
+        """Add file to recent files list"""
+        recent = self.load_recent_files()
+        if file_path in recent:
+            recent.remove(file_path)
+        recent.insert(0, file_path)
+        self.save_recent_files(recent)
+        self.update_recent_files()
+    
+    def update_recent_files(self):
+        """Update recent files menu"""
+        self.recent_files_menu.delete(0, tk.END)
+        recent = self.load_recent_files()
+        
+        for file_path in recent:
+            if Path(file_path).exists():
+                filename = Path(file_path).name
+                self.recent_files_menu.add_command(
+                    label=filename,
+                    command=lambda fp=file_path: self.load_file_from_path(fp)
+                )
+        
+        if not recent:
+            self.recent_files_menu.add_command(label="No recent files", state="disabled")
+    
+    def load_file_from_path(self, file_path):
+        """Load file from given path"""
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            
+            if ext == ".csv":
+                self.data = _read_table_auto_encoding(file_path)
+            elif ext == ".xlsx":
+                self.data = pd.read_excel(file_path)
+            elif ext == ".txt":
+                with open(file_path, "rb") as f:
+                    first_line = b""
+                    while first_line.strip() == b"":
+                        first_line = f.readline()
+                
+                if b"\t" in first_line:
+                    delim = "\t"
+                elif b"," in first_line:
+                    delim = ","
+                else:
+                    delim = r"\s+"
+                
+                self.data = _read_table_auto_encoding(file_path, sep=delim, engine="python")
+            
+            self.current_file_path = file_path
+            filename = os.path.basename(file_path)
+            self.file_label.configure(
+                text=f"Loaded: {filename}",
+                text_color=("green", "#2FA572"),
+                font=ctk.CTkFont(size=12, weight="bold"),
+            )
+            
+            self.time_column = "Time" if "Time" in self.data.columns else self.data.columns[0]
+            self.channel_names = [c for c in self.data.columns if c != self.time_column]
+            self.channel_conditioning = {}
+            
+            self.build_channel_checkboxes()
+            self.refresh_dropdowns()
+            self.update_step_status(0, True)
+            self.add_to_recent_files(file_path)
+            self.update_status(f"Loaded: {filename}", f"{len(self.data)} rows, {len(self.channel_names)} channels")
+            
+        except Exception as e:
+            messagebox.showerror("Error Loading File", f"Failed to load file: {e}")
+    
+    # ========== Project Save/Load Functions ==========
+    
+    def save_project(self):
+        """Save project (settings + data)"""
+        if self.data is None:
+            messagebox.showwarning("No Data", "No data to save.")
+            return
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".dap",
+            filetypes=[("Data Analyzer Project", "*.dap"), ("All Files", "*.*")]
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            import pickle
+            project_data = {
+                'data_file_path': self.current_file_path,
+                'active_channels': {k: v.get() for k, v in self.active_channels.items()},
+                'channel_names': self.channel_names,
+                'time_column': self.time_column,
+                'x_selector': self.x_selector.get() if hasattr(self, 'x_selector') else None,
+                'primary_enabled': self.primary_enabled.get() if hasattr(self, 'primary_enabled') else False,
+                'secondary_enabled': self.secondary_enabled.get() if hasattr(self, 'secondary_enabled') else False,
+                'y_op': self.y_op_menu.get() if hasattr(self, 'y_op_menu') else None,
+                'a_channel': self.a_menu.get() if hasattr(self, 'a_menu') else None,
+                'b_channel': self.b_menu.get() if hasattr(self, 'b_menu') else None,
+                'filter_type': self.filter_menu.get() if hasattr(self, 'filter_menu') else "None",
+                'plot_settings': {
+                    'x_units': self.x_units.get() if hasattr(self, 'x_units') else "None",
+                    'y1_units': self.y1_units.get() if hasattr(self, 'y1_units') else "None",
+                    'y2_units': self.y2_units.get() if hasattr(self, 'y2_units') else "None",
+                }
+            }
+            
+            with open(file_path, 'wb') as f:
+                pickle.dump({
+                    'project_data': project_data,
+                    'data': self.data
+                }, f)
+            
+            self.add_to_recent_files(file_path)
+            self.update_status(f"Project saved: {os.path.basename(file_path)}")
+            messagebox.showinfo("Success", f"Project saved successfully to:\n{file_path}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save project: {str(e)}")
+    
+    def load_project(self):
+        """Load project"""
+        file_path = filedialog.askopenfilename(
+            filetypes=[("Data Analyzer Project", "*.dap"), ("All Files", "*.*")]
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            import pickle
+            with open(file_path, 'rb') as f:
+                project = pickle.load(f)
+            
+            self.data = project['data']
+            project_data = project['project_data']
+            
+            self.active_channels = {}
+            self.channel_names = project_data.get('channel_names', [])
+            self.time_column = project_data.get('time_column', 'Time')
+            self.current_file_path = project_data.get('data_file_path')
+            
+            # Restore UI state
+            self.build_channel_checkboxes()
+            
+            # Restore channel selections
+            active_dict = project_data.get('active_channels', {})
+            for name, var in self.active_channels.items():
+                if name in active_dict:
+                    var.set(active_dict[name])
+            
+            self.refresh_dropdowns()
+            
+            # Restore plot settings if available
+            if 'x_selector' in project_data and project_data['x_selector']:
+                self.x_selector.set(project_data['x_selector'])
+            
+            self.add_to_recent_files(file_path)
+            self.update_status(f"Project loaded: {os.path.basename(file_path)}", 
+                             f"{len(self.data)} rows, {len(self.channel_names)} channels")
+            messagebox.showinfo("Success", "Project loaded successfully!")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load project: {str(e)}")
+    
+    # ========== Export Functions ==========
+    
+    def export_plot_dialog(self):
+        """Export plot with high-quality options"""
+        if self.fig is None:
+            messagebox.showwarning("No Plot", "No plot to export.")
+            return
+        
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[
+                ("PNG (High Quality)", "*.png"),
+                ("PDF (Vector)", "*.pdf"),
+                ("SVG (Vector)", "*.svg"),
+                ("EPS (Publication)", "*.eps"),
+                ("TIFF (High Quality)", "*.tiff")
+            ]
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # Set high DPI for raster formats
+            dpi = 300 if file_path.endswith(('.png', '.tiff')) else None
+            
+            self.fig.savefig(
+                file_path,
+                dpi=dpi,
+                bbox_inches='tight',
+                facecolor='white',
+                edgecolor='none',
+                format=Path(file_path).suffix[1:] if Path(file_path).suffix else 'png'
+            )
+            
+            self.update_status(f"Plot exported to: {os.path.basename(file_path)}")
+            messagebox.showinfo("Success", f"Plot exported successfully to:\n{file_path}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to export plot: {str(e)}")
+    
+    # ========== Data Browser Functions ==========
+    
+    def open_data_browser(self):
+        """Open data browser window"""
+        if self.data is None:
+            messagebox.showinfo("No Data", "Please load data first.")
+            return
+        
+        browser = ctk.CTkToplevel(self.window)
+        browser.title("Data Browser")
+        browser.geometry("900x600")
+        
+        # Create scrollable frame
+        frame = ctk.CTkScrollableFrame(browser)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Create text widget for data display
+        text_widget = tk.Text(frame, wrap="none", font=("Courier", 9))
+        text_widget.pack(fill="both", expand=True)
+        
+        # Display data (limit to first 10000 rows for performance)
+        display_data = self.data.head(10000) if len(self.data) > 10000 else self.data
+        text_widget.insert("1.0", display_data.to_string())
+        if len(self.data) > 10000:
+            text_widget.insert("end", f"\n\n... (showing first 10000 of {len(self.data)} rows)")
+        text_widget.config(state="disabled")
+        
+        # Statistics button
+        stats_btn = ctk.CTkButton(
+            browser,
+            text="Show Column Statistics",
+            command=lambda: self.show_column_statistics(browser)
+        )
+        stats_btn.pack(pady=10)
+    
+    def show_column_statistics(self, parent):
+        """Show column statistics dialog"""
+        if self.data is None:
+            return
+        
+        stats_window = ctk.CTkToplevel(parent)
+        stats_window.title("Column Statistics")
+        stats_window.geometry("500x600")
+        
+        frame = ctk.CTkScrollableFrame(stats_window)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        for col in self.data.columns:
+            if self.data[col].dtype in [np.float64, np.int64, float, int]:
+                col_data = self.data[col].dropna()
+                if len(col_data) > 0:
+                    stats_text = f"""
+{col}:
+  Count:  {len(col_data)}
+  Mean:   {np.mean(col_data):.6f}
+  Std:    {np.std(col_data):.6f}
+  Min:    {np.min(col_data):.6f}
+  Max:    {np.max(col_data):.6f}
+  Median: {np.median(col_data):.6f}
+  Range:  {np.max(col_data) - np.min(col_data):.6f}
+"""
+                    label = ctk.CTkLabel(frame, text=stats_text, anchor="w", justify="left", font=ctk.CTkFont(family="Courier", size=11))
+                    label.pack(fill="x", padx=10, pady=5)
+        
+        close_btn = ctk.CTkButton(stats_window, text="Close", command=stats_window.destroy)
+        close_btn.pack(pady=10)
+
     def create_layout(self):
         # Configure window grid
         self.window.grid_columnconfigure(0, weight=1)  # Sidebar
         self.window.grid_columnconfigure(1, weight=3)  # Controls (center)
         self.window.grid_columnconfigure(2, weight=5)  # Plot (right)
-        self.window.grid_rowconfigure(0, weight=1)
+        self.window.grid_rowconfigure(0, weight=1)  # Main content row
+        self.window.grid_rowconfigure(1, weight=0)  # Status bar row (fixed height)
 
         # ---- 1. Sidebar (left) ----
         self.sidebar_frame = ctk.CTkFrame(self.window, corner_radius=0, fg_color=("gray90", "gray16"))
@@ -478,14 +1053,16 @@ class DataAnalyzerApp:
         # 3. Right column (plot area)
         self.plot_frame = ctk.CTkFrame(self.window)
         self.plot_frame.grid(row=0, column=2, sticky="nsew", padx=10, pady=10)
-
+        self.plot_frame.grid_rowconfigure(1, weight=1)  # Make plot area expandable
+        self.plot_frame.grid_columnconfigure(0, weight=1)
+        
         # Plot title
         self.plot_title = ctk.CTkLabel(
             self.plot_frame,
             text="Results Visualization",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        self.plot_title.pack(pady=(15, 0))
+        self.plot_title.grid(row=0, column=0, pady=(15, 0), sticky="ew")
 
         # Plot info
         self.plot_info = ctk.CTkLabel(
@@ -494,9 +1071,9 @@ class DataAnalyzerApp:
             font=ctk.CTkFont(size=12),
             text_color=("gray50", "gray70")
         )
-        self.plot_info.pack(pady=(0, 15))
+        self.plot_info.grid(row=0, column=0, pady=(35, 15), sticky="ew")
 
-        # Placeholder for plot
+        # Placeholder for plot - use regular frame, not scrollable
         self.plot_placeholder = ctk.CTkFrame(
             self.plot_frame,
             fg_color=("gray90", "gray20"),
@@ -504,7 +1081,11 @@ class DataAnalyzerApp:
             border_width=1,
             border_color=("gray70", "gray30")
         )
-        self.plot_placeholder.pack(fill="both", expand=True, padx=20, pady=20)
+        # Use grid for plot placeholder - configure properly for matplotlib
+        self.plot_placeholder.grid(row=1, column=0, sticky="nsew", padx=20, pady=20)
+        # Configure grid weights - row 0 for toolbar, row 1 for canvas
+        self.plot_placeholder.grid_rowconfigure(1, weight=1)
+        self.plot_placeholder.grid_columnconfigure(0, weight=1)
 
         # Placeholder text
         self.plot_placeholder_text = ctk.CTkLabel(
@@ -516,7 +1097,7 @@ class DataAnalyzerApp:
 
         # Bottom toolbar for plot controls
         self.plot_toolbar = ctk.CTkFrame(self.plot_frame, fg_color="transparent")
-        self.plot_toolbar.pack(fill="x", pady=(0, 10), padx=20)
+        self.plot_toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 10), padx=20)
 
         # Export button
         self.export_button = ctk.CTkButton(
@@ -759,6 +1340,32 @@ class DataAnalyzerApp:
             height=28
         )
         edit_labels_btn.pack(side="left")
+
+        # --- Plot Type Selection ---
+        plot_type_frame = ctk.CTkFrame(self.graph_frame, fg_color="transparent")
+        plot_type_frame.pack(fill="x", pady=5)
+        
+        plot_type_label = ctk.CTkLabel(plot_type_frame, text="Plot Type:", width=100, anchor="e")
+        plot_type_label.pack(side="left", padx=(0, 10))
+        
+        self.plot_type_menu = ctk.CTkOptionMenu(
+            plot_type_frame,
+            values=["Line", "Scatter", "Line+Scatter", "Bar", "Histogram", "Step"],
+            width=200
+        )
+        self.plot_type_menu.set("Line")
+        self.plot_type_menu.pack(side="left")
+        
+        # Peak detection button
+        self.peak_detection_btn = ctk.CTkButton(
+            plot_type_frame,
+            text="Detect Peaks",
+            command=self.detect_and_plot_peaks,
+            width=120,
+            fg_color=("gray70", "gray30"),
+            hover_color=("gray60", "gray40")
+        )
+        self.peak_detection_btn.pack(side="left", padx=(10, 0))
 
         # --- Tab Selection (Primary/Secondary) ---
         tab_frame = ctk.CTkFrame(self.graph_frame)
@@ -1633,8 +2240,57 @@ class DataAnalyzerApp:
             )
             label.configure(font=ctk.CTkFont(size=14, weight="normal"))
 
+    def ask_skip_header_rows(self):
+        """Ask user if they want to skip header rows"""
+        dialog = ctk.CTkToplevel(self.window)
+        dialog.title("Skip Header Rows")
+        dialog.geometry("400x200")
+        dialog.transient(self.window)
+        dialog.grab_set()
+        
+        label = ctk.CTkLabel(
+            dialog, 
+            text="Does your file have header rows to skip?\nEnter number of rows to skip (0 for none):"
+        )
+        label.pack(pady=20)
+        
+        entry = ctk.CTkEntry(dialog, width=100)
+        entry.insert(0, "0")
+        entry.pack(pady=10)
+        entry.focus()
+        
+        result = [0]  # Use list to modify from nested function
+        
+        def ok_clicked():
+            try:
+                result[0] = int(entry.get())
+                if result[0] < 0:
+                    result[0] = 0
+                dialog.destroy()
+            except ValueError:
+                messagebox.showerror("Invalid Input", "Please enter a valid number")
+        
+        def cancel_clicked():
+            result[0] = None
+            dialog.destroy()
+        
+        button_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        button_frame.pack(pady=20)
+        
+        ok_btn = ctk.CTkButton(button_frame, text="OK", command=ok_clicked, width=100)
+        ok_btn.pack(side="left", padx=10)
+        
+        cancel_btn = ctk.CTkButton(button_frame, text="Cancel", command=cancel_clicked, width=100)
+        cancel_btn.pack(side="left", padx=10)
+        
+        # Bind Enter key
+        entry.bind("<Return>", lambda e: ok_clicked())
+        
+        dialog.wait_window()
+        return result[0]
+
     def load_file(self):
-        # ── 1 File‑open dialog ─────────────────────────────────────────────
+        # ── 1 File‑open dialog ─────────────────────────────────────────────
         file_path = filedialog.askopenfilename(
             filetypes=[
                 ("CSV", "*.csv"),
@@ -1645,16 +2301,21 @@ class DataAnalyzerApp:
         if not file_path:  # user cancelled
             return
 
+        # Ask user if they want to skip header rows
+        skip_rows = self.ask_skip_header_rows()
+        if skip_rows is None:  # User cancelled
+            return
+
         try:
             ext = os.path.splitext(file_path)[1].lower()
 
-            # ── 2 Load according to extension ──────────────────────────────
+            # ── 2 Load according to extension ──────────────────────────────
             if ext == ".csv":
                 # robust encoding auto‑detection
-                self.data = _read_table_auto_encoding(file_path)
+                self.data = _read_table_auto_encoding(file_path, skiprows=skip_rows)
 
             elif ext == ".xlsx":
-                self.data = pd.read_excel(file_path)  # Excel is binary → no encoding issue
+                self.data = pd.read_excel(file_path, skiprows=skip_rows)  # Excel is binary → no encoding issue
 
             elif ext == ".txt":
                 # quick delimiter sniff (first non‑empty text line)
@@ -1672,7 +2333,7 @@ class DataAnalyzerApp:
 
                 # read with auto‑encoding + chosen delimiter
                 self.data = _read_table_auto_encoding(
-                    file_path, sep=delim, engine="python"
+                    file_path, sep=delim, engine="python", skiprows=skip_rows
                 )
 
                 # convert to CSV so the rest of the app sees a uniform format
@@ -1687,7 +2348,8 @@ class DataAnalyzerApp:
             else:
                 raise ValueError("Unsupported file type")
 
-            # ── 3 House‑keeping after successful load ──────────────────────
+            # ── 3 House‑keeping after successful load ──────────────────────
+            self.current_file_path = file_path
             filename = os.path.basename(file_path)
             self.file_label.configure(
                 text=f"Loaded: {filename}",
@@ -1705,6 +2367,10 @@ class DataAnalyzerApp:
             self.build_channel_checkboxes()
             self.refresh_dropdowns()
             self.update_step_status(0, True)
+            
+            # Add to recent files and update status
+            self.add_to_recent_files(file_path)
+            self.update_status(f"Loaded: {filename}", f"{len(self.data)} rows, {len(self.channel_names)} channels")
 
             messagebox.showinfo(
                 "File Loaded",
@@ -2065,6 +2731,10 @@ class DataAnalyzerApp:
             messagebox.showerror("Error", "No data loaded. Please load a data file first.")
             return
 
+        # Show progress for long operations
+        self.update_status("Generating plot...")
+        self.show_progress(0.1)
+
         x_name = self.x_selector.get()
 
         # ------------- gather GUI selections --------------------
@@ -2090,9 +2760,11 @@ class DataAnalyzerApp:
         # ------------- basic validation -------------------------
         if not primary_enabled and not secondary_enabled:
             messagebox.showerror("Error", "At least one Y‑axis must be enabled.")
+            self.hide_progress()
             return
 
         try:
+            self.show_progress(0.2)
             x = self.get_series(x_name)
 
             # ----------- PRIMARY Y -------------------------
@@ -2352,6 +3024,10 @@ class DataAnalyzerApp:
             self.update_step_status(2, True)
             self.update_step_status(3, True)
             self.export_button.configure(state="normal")
+            
+            # Hide progress when done
+            self.hide_progress()
+            self.update_status("Plot generated successfully")
 
             if hasattr(self, 'auto_fit_after_plot') and self.auto_fit_after_plot.get():
                 try:
@@ -2363,6 +3039,8 @@ class DataAnalyzerApp:
             messagebox.showerror("Plot Error", f"Error generating plot: {e}")
             self.update_step_status(2, False)
             self.update_step_status(3, False)
+            self.hide_progress()
+            self.update_status("Error generating plot")
 
     def evaluate_math_expression(self, expr):
         context = {col: self.data[col].values for col in self.data.columns}
@@ -2388,6 +3066,13 @@ class DataAnalyzerApp:
         # Remove previous plot if exists
         for widget in self.plot_placeholder.winfo_children():
             widget.destroy()
+        
+        # Also remove placeholder text if it exists (it uses place, not pack/grid)
+        if hasattr(self, 'plot_placeholder_text'):
+            try:
+                self.plot_placeholder_text.destroy()
+            except:
+                pass
 
         self.fig, ax1 = plt.subplots(figsize=(8, 6), dpi=100)
 
@@ -2423,21 +3108,73 @@ class DataAnalyzerApp:
                 if "(" not in y2_label_with_units:
                     y2_label_with_units += f" ({y2_units})"
 
+        # Get plot type
+        plot_type = self.plot_type_menu.get() if hasattr(self, 'plot_type_menu') else "Line"
+        
         # Plot the primary y-axis data if available
         line1 = []
         if y is not None:
-            line1 = ax1.plot(
-                x, y,
-                linewidth=2,
-                color=line_color1 if line_color1 else "#1F77B4",
-                marker=marker1 if marker1 and marker1 != "None" else "",
-                markerfacecolor=markerfacecolor1 if markerfacecolor1 else line_color1,
-                markeredgecolor=markeredgecolor1 if markeredgecolor1 else line_color1,
-                linestyle="None" if marker1 and marker1 != "None" else "-",
-                label=y1_label_with_units
-            )
-            ax1.set_xlabel(x_label_with_units, fontsize=12)
-            ax1.set_ylabel(y1_label_with_units, fontsize=12, color=axis_color)
+            if plot_type == "Scatter":
+                line1 = ax1.scatter(
+                    x, y,
+                    s=30,
+                    color=line_color1 if line_color1 else "#1F77B4",
+                    marker=marker1 if marker1 and marker1 != "None" else "o",
+                    label=y1_label_with_units,
+                    alpha=0.7
+                )
+            elif plot_type == "Line+Scatter":
+                line1 = ax1.plot(
+                    x, y,
+                    linewidth=2,
+                    color=line_color1 if line_color1 else "#1F77B4",
+                    marker=marker1 if marker1 and marker1 != "None" else "o",
+                    markerfacecolor=markerfacecolor1 if markerfacecolor1 else line_color1,
+                    markeredgecolor=markeredgecolor1 if markeredgecolor1 else line_color1,
+                    markersize=6,
+                    label=y1_label_with_units
+                )
+            elif plot_type == "Bar":
+                line1 = ax1.bar(
+                    x, y,
+                    color=line_color1 if line_color1 else "#1F77B4",
+                    alpha=0.7,
+                    width=(np.max(x) - np.min(x)) / len(x) * 0.8 if len(x) > 1 else 0.1,
+                    label=y1_label_with_units
+                )
+            elif plot_type == "Histogram":
+                line1 = ax1.hist(
+                    y,
+                    bins=min(50, len(y) // 10) if len(y) > 10 else 10,
+                    color=line_color1 if line_color1 else "#1F77B4",
+                    alpha=0.7,
+                    label=y1_label_with_units
+                )
+                ax1.set_xlabel(y1_label_with_units, fontsize=12)
+                ax1.set_ylabel("Frequency", fontsize=12, color=axis_color)
+            elif plot_type == "Step":
+                line1 = ax1.step(
+                    x, y,
+                    linewidth=2,
+                    color=line_color1 if line_color1 else "#1F77B4",
+                    where='mid',
+                    label=y1_label_with_units
+                )
+            else:  # Line (default)
+                line1 = ax1.plot(
+                    x, y,
+                    linewidth=2,
+                    color=line_color1 if line_color1 else "#1F77B4",
+                    marker=marker1 if marker1 and marker1 != "None" else "",
+                    markerfacecolor=markerfacecolor1 if markerfacecolor1 else line_color1,
+                    markeredgecolor=markeredgecolor1 if markeredgecolor1 else line_color1,
+                    linestyle="None" if marker1 and marker1 != "None" else "-",
+                    label=y1_label_with_units
+                )
+            
+            if plot_type != "Histogram":
+                ax1.set_xlabel(x_label_with_units, fontsize=12)
+                ax1.set_ylabel(y1_label_with_units, fontsize=12, color=axis_color)
             ax1.tick_params(axis='y', colors=axis_color)
 
         # Apply axis colors and tick sizes to primary axis
@@ -2451,16 +3188,47 @@ class DataAnalyzerApp:
         line2 = []
         if y2 is not None:
             ax2 = ax1.twinx()
-            line2 = ax2.plot(
-                x, y2,
-                linewidth=2,
-                color=line_color2 if line_color2 else "orange",
-                marker=marker2 if marker2 and marker2 != "None" else "",
-                markerfacecolor=markerfacecolor2 if markerfacecolor2 else line_color2,
-                markeredgecolor=markeredgecolor2 if markeredgecolor2 else line_color2,
-                linestyle="None" if marker2 and marker2 != "None" else "--",  # Default: dashed line if no marker
-                label=y2_label_with_units
-            )
+            if plot_type == "Scatter":
+                line2 = ax2.scatter(
+                    x, y2,
+                    s=30,
+                    color=line_color2 if line_color2 else "orange",
+                    marker=marker2 if marker2 and marker2 != "None" else "s",
+                    label=y2_label_with_units,
+                    alpha=0.7
+                )
+            elif plot_type == "Line+Scatter":
+                line2 = ax2.plot(
+                    x, y2,
+                    linewidth=2,
+                    color=line_color2 if line_color2 else "orange",
+                    marker=marker2 if marker2 and marker2 != "None" else "s",
+                    markerfacecolor=markerfacecolor2 if markerfacecolor2 else line_color2,
+                    markeredgecolor=markeredgecolor2 if markeredgecolor2 else line_color2,
+                    markersize=6,
+                    linestyle="--",
+                    label=y2_label_with_units
+                )
+            elif plot_type == "Step":
+                line2 = ax2.step(
+                    x, y2,
+                    linewidth=2,
+                    color=line_color2 if line_color2 else "orange",
+                    where='mid',
+                    linestyle="--",
+                    label=y2_label_with_units
+                )
+            else:  # Line, Bar, Histogram
+                line2 = ax2.plot(
+                    x, y2,
+                    linewidth=2,
+                    color=line_color2 if line_color2 else "orange",
+                    marker=marker2 if marker2 and marker2 != "None" else "",
+                    markerfacecolor=markerfacecolor2 if markerfacecolor2 else line_color2,
+                    markeredgecolor=markeredgecolor2 if markeredgecolor2 else line_color2,
+                    linestyle="None" if marker2 and marker2 != "None" else "--",
+                    label=y2_label_with_units
+                )
             ax2.set_ylabel(y2_label_with_units, fontsize=12, color=axis_color)
             ax2.tick_params(axis='y', colors=axis_color)
             # Apply axis colors and tick sizes to secondary axis
@@ -2490,78 +3258,174 @@ class DataAnalyzerApp:
             ax1.spines['right'].set_visible(False)
 
         self.fig.tight_layout()
+        
+        # Configure plot_placeholder grid if not already configured
+        self.plot_placeholder.grid_rowconfigure(1, weight=1)
+        self.plot_placeholder.grid_columnconfigure(0, weight=1)
+        
+        # Add navigation toolbar for zoom/pan
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+        toolbar_frame = ctk.CTkFrame(self.plot_placeholder)
+        toolbar_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
+        
+        # Create canvas with interactive features
         canvas = FigureCanvasTkAgg(self.fig, master=self.plot_placeholder)
         canvas.draw()
-        canvas.get_tk_widget().pack(fill="both", expand=True)
+        
+        self.navigation_toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        self.navigation_toolbar.update()
+        
+        # Grid canvas after toolbar - ensure it's visible
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.grid(row=1, column=0, sticky="nsew")
+        self.canvas_widget = canvas
+        
+        # Force update to ensure visibility
+        self.plot_placeholder.update_idletasks()
+        self.window.update_idletasks()
+        
+        # Add data cursor functionality
+        self.annot = None
+        if y is not None or y2 is not None:
+            # Create annotation for data cursor
+            self.annot = ax1.annotate('', xy=(0,0), xytext=(20,20), 
+                                     textcoords="offset points",
+                                     bbox=dict(boxstyle="round", fc="w", alpha=0.8),
+                                     arrowprops=dict(arrowstyle="->"))
+            self.annot.set_visible(False)
+            
+            def on_hover(event):
+                if event.inaxes == ax1 and self.annot and event.xdata is not None:
+                    try:
+                        # Find closest point
+                        idx = np.argmin(np.abs(x - event.xdata))
+                        x_val = x[idx]
+                        y_val = y[idx] if y is not None else None
+                        y2_val = y2[idx] if y2 is not None else None
+                        
+                        # Update annotation
+                        y_display = y_val if y_val is not None else (y2_val if y2_val is not None else 0)
+                        self.annot.xy = (x_val, y_display)
+                        text = f'X: {x_val:.4f}'
+                        if y_val is not None:
+                            text += f'\nY1: {y_val:.4f}'
+                        if y2_val is not None:
+                            text += f'\nY2: {y2_val:.4f}'
+                        self.annot.set_text(text)
+                        self.annot.set_visible(True)
+                        canvas.draw_idle()
+                    except Exception:
+                        pass
+            
+            def on_leave(event):
+                if self.annot:
+                    self.annot.set_visible(False)
+                    canvas.draw_idle()
+            
+            canvas.mpl_connect('motion_notify_event', on_hover)
+            canvas.mpl_connect('axes_leave_event', on_leave)
+        
+        # Update window to ensure plot is visible
+        self.window.update_idletasks()
 
-        if custom_plot_title and custom_plot_title.strip():
-            display_title = custom_plot_title
-        elif y2 is not None and y is not None:
-            display_title = f"Dual Y-Axis Plot: {y1_label_with_units} and {y2_label_with_units}"
-        elif y is not None:
-            display_title = f"Results: {y1_label_with_units} vs {x_label_with_units}"
-        elif y2 is not None:
-            display_title = f"Results: {y2_label_with_units} vs {x_label_with_units}"
-        else:
-            display_title = "No data to display"
-
-        self.plot_title.configure(text=display_title)
-
-        if y2 is not None and y is not None:
-            max_idx_y = np.argmax(y)
-            x_max_y = x[max_idx_y]
-            y_max = y[max_idx_y]
-            max_idx_y2 = np.argmax(y2)
-            x_max_y2 = x[max_idx_y2]
-            y2_max = y2[max_idx_y2]
-            stats_text = (
-                f"Statistics Primary ({line_color1.capitalize()}):\n"
-                f"Mean: {np.mean(y):.4g}\n"
-                f"Min: {np.min(y):.4g}\n"
-                f"Max: {np.max(y):.4g}\n"
-                f"Range: {np.max(y) - np.min(y):.4g}\n"
-                f"Max at: (X={x_max_y:.4g}, Y={y_max:.4g})\n\n"
-                f"Statistics Secondary ({line_color2.capitalize()}):\n"
-                f"Mean: {np.mean(y2):.4g}\n"
-                f"Min: {np.min(y2):.4g}\n"
-                f"Max: {np.max(y2):.4g}\n"
-                f"Range: {np.max(y2) - np.min(y2):.4g}\n"
-                f"Max at: (X={x_max_y2:.4g}, Y={y2_max:.4g})"
-            )
-        elif y is not None:
-            max_idx_y = np.argmax(y)
-            x_max_y = x[max_idx_y]
-            y_max = y[max_idx_y]
-            stats_text = (
-                f"Statistics:\n"
-                f"Mean: {np.mean(y):.4g}\n"
-                f"Min: {np.min(y):.4g}\n"
-                f"Max: {np.max(y):.4g}\n"
-                f"Range: {np.max(y) - np.min(y):.4g}\n"
-                f"Max at: (X={x_max_y:.4g}, Y={y_max:.4g})"
-            )
-        elif y2 is not None:
-            max_idx_y2 = np.argmax(y2)
-            x_max_y2 = x[max_idx_y2]
-            y2_max = y2[max_idx_y2]
-            stats_text = (
-                f"Statistics:\n"
-                f"Mean: {np.mean(y2):.4g}\n"
-                f"Min: {np.min(y2):.4g}\n"
-                f"Max: {np.max(y2):.4g}\n"
-                f"Range: {np.max(y2) - np.min(y2):.4g}\n"
-                f"Max at: (X={x_max_y2:.4g}, Y={y2_max:.4g})"
-            )
-        else:
-            stats_text = "No statistics available"
-
-        self.plot_info.configure(text=stats_text)
-
-        # keep last plotted arrays for fitting/export
-        self.last_y2 = y2
-        self.last_y2_name = y2_label
-
-    ### 1. Add this function to the DataAnalyzerApp class
+    def detect_and_plot_peaks(self):
+        """Detect and visualize peaks on the current plot"""
+        if not hasattr(self, 'last_x') or not hasattr(self, 'last_y'):
+            messagebox.showwarning("No Data", "Please generate a plot first.")
+            return
+        
+        from scipy.signal import find_peaks
+        
+        # Ask user for peak detection parameters
+        dialog = ctk.CTkToplevel(self.window)
+        dialog.title("Peak Detection Parameters")
+        dialog.geometry("400x250")
+        dialog.transient(self.window)
+        dialog.grab_set()
+        
+        ctk.CTkLabel(dialog, text="Peak Detection Parameters", font=ctk.CTkFont(size=14, weight="bold")).pack(pady=10)
+        
+        height_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        height_frame.pack(pady=5)
+        ctk.CTkLabel(height_frame, text="Min Height (% of max):", width=150).pack(side="left", padx=5)
+        height_entry = ctk.CTkEntry(height_frame, width=100)
+        height_entry.insert(0, "50")
+        height_entry.pack(side="left", padx=5)
+        
+        distance_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        distance_frame.pack(pady=5)
+        ctk.CTkLabel(distance_frame, text="Min Distance (points):", width=150).pack(side="left", padx=5)
+        distance_entry = ctk.CTkEntry(distance_frame, width=100)
+        distance_entry.insert(0, "10")
+        distance_entry.pack(side="left", padx=5)
+        
+        prominence_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        prominence_frame.pack(pady=5)
+        ctk.CTkLabel(prominence_frame, text="Prominence (% of max):", width=150).pack(side="left", padx=5)
+        prominence_entry = ctk.CTkEntry(prominence_frame, width=100)
+        prominence_entry.insert(0, "30")
+        prominence_entry.pack(side="left", padx=5)
+        
+        result = [None]
+        
+        def detect():
+            try:
+                y_data = self.last_y
+                height_pct = float(height_entry.get()) / 100.0
+                distance = int(distance_entry.get())
+                prominence_pct = float(prominence_entry.get()) / 100.0
+                
+                height = np.max(y_data) * height_pct
+                prominence = (np.max(y_data) - np.min(y_data)) * prominence_pct
+                
+                peaks, properties = find_peaks(
+                    y_data,
+                    height=height,
+                    distance=distance,
+                    prominence=prominence
+                )
+                
+                result[0] = peaks
+                dialog.destroy()
+                
+                # Plot peaks on current figure
+                if self.fig:
+                    ax = self.fig.get_axes()[0]
+                    x_peaks = self.last_x[peaks]
+                    y_peaks = y_data[peaks]
+                    
+                    # Mark peaks
+                    ax.plot(x_peaks, y_peaks, 'ro', markersize=10, label=f'Peaks ({len(peaks)})', zorder=5)
+                    
+                    # Annotate peaks
+                    for i, (x_p, y_p) in enumerate(zip(x_peaks, y_peaks)):
+                        ax.annotate(
+                            f'P{i+1}\n({x_p:.2f}, {y_p:.2f})',
+                            xy=(x_p, y_p),
+                            xytext=(10, 10),
+                            textcoords='offset points',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
+                            arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'),
+                            fontsize=8
+                        )
+                    
+                    ax.legend()
+                    if hasattr(self, 'canvas_widget') and self.canvas_widget:
+                        self.canvas_widget.draw()
+                    
+                    messagebox.showinfo("Peak Detection", f"Found {len(peaks)} peaks!")
+                    self.update_status(f"Detected {len(peaks)} peaks")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Peak detection failed: {e}")
+        
+        button_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        button_frame.pack(pady=20)
+        
+        ctk.CTkButton(button_frame, text="Detect", command=detect, width=100).pack(side="left", padx=10)
+        ctk.CTkButton(button_frame, text="Cancel", command=dialog.destroy, width=100).pack(side="left", padx=10)
+        
+        dialog.wait_window()
 
     def edit_channel_names(self):
         """Open a dialog to edit channel names"""
