@@ -1,7 +1,7 @@
 # 📈 Data Analyzer Pro
 
 **An advanced, user-friendly GUI tool for experimental physics and engineering data analysis.**
-
+![Data Analyzer Pro Screenshot](screenshot.png)
 ![Python](https://img.shields.io/badge/Python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/License-Non--Commercial-red)
 ![Status](https://img.shields.io/badge/Status-Stable-green)
